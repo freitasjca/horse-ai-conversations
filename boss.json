@@ -1,0 +1,14 @@
+{
+  "name": "horse-ai-conversations",
+  "version": "0.1.0-alpha.1",
+  "description": "AI conversation ownership and persistence for Horse: binds horse-session principals to horse-ai streams with ownership-checked cancellation, multiple conversations per user, (tenant_id, principal_id, conversation_id) tuple as logical key, pluggable IAIConversationStore (in-memory default; durable adapters ship as siblings). Reuses horse-session's TAuthAuditEvent + IAuthAuditSink unchanged.",
+  "mainsrc": "src/",
+  "browsingpath": "src/",
+  "homepage": "https://github.com/freitasjca/horse-ai-conversations",
+  "license": "MIT",
+  "dependencies": {
+    "github.com/HashLoad/horse": ">=3.3.13",
+    "github.com/freitasjca/horse-session": ">=0.1.0",
+    "github.com/freitasjca/horse-ai": ">=0.1.0"
+  }
+}
