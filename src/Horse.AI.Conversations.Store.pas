@@ -133,14 +133,16 @@ end;
 function TMemoryConversationStore.OwnedBy(const ARow: TMemRow;
                                           const ATenantId, APrincipalId: string): Boolean;
 begin
-  Result := SameText(ARow.Record_.TenantId, ATenantId) and
-            SameText(ARow.Record_.PrincipalId, APrincipalId);
+  // Exact match: two ids that differ only by letter case are two owners.
+  Result := (ARow.Record_.TenantId = ATenantId) and
+            (ARow.Record_.PrincipalId = APrincipalId);
 end;
 
 function TMemoryConversationStore.CopyMessages(const AMessages: TAIMessages): TAIMessages;
 var
   I: Integer;
 begin
+  Result := nil;
   SetLength(Result, Length(AMessages));
   for I := 0 to High(AMessages) do
     Result[I] := AMessages[I];
@@ -198,7 +200,7 @@ var
   LCount: Integer;
   LSummary: TAIConversationSummary;
 begin
-  SetLength(Result, 0);
+  Result := nil;
   FLock.Enter;
   try
     LCount := 0;

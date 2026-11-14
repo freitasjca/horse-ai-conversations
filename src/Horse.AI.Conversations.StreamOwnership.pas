@@ -110,8 +110,9 @@ var
 begin
   Result := False;
   if not TryGetOwner(AStreamId, LOwner) then Exit;
-  Result := SameText(LOwner.TenantId, ATenantId) and
-            SameText(LOwner.PrincipalId, APrincipalId);
+  // Exact match: two ids that differ only by letter case are two owners.
+  Result := (LOwner.TenantId = ATenantId) and
+            (LOwner.PrincipalId = APrincipalId);
 end;
 
 function TStreamOwnershipMap.Unregister(const AStreamId: string): Boolean;
@@ -150,6 +151,7 @@ var
   LKey: string;
   I: Integer;
 begin
+  Result := nil;
   FLock.Enter;
   try
     SetLength(Result, FOwners.Count);

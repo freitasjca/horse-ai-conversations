@@ -31,52 +31,68 @@ boss install github.com/freitasjca/horse-ai-conversations
 
 ```pascal
 uses
+  System.SysUtils,
   Horse,
-  Horse.Session,
+  Horse.Session.Middleware,
   Horse.Session.Types,
-  Horse.AI,
+  Horse.AI.Types,
+  Horse.AI.StreamManager,
   Horse.AI.Conversations,
-  Horse.AI.Conversations.Types,
-  Horse.AI.Conversations.Store;
+  Horse.AI.Conversations.Types;
 
 var
-  LConvConfig: THorseAIConversationsConfig;
-  LStore: IAIConversationStore;
+  LConfig: THorseAIConversationsConfig;
+  LConversations: THorseAIConversations;
 begin
-  // 1. horse-session establishes identity
+  // 1. horse-session establishes identity on every request
   THorse.Use(THorseSession.New({ your session config }));
 
-  // 2. horse-ai-conversations binds streams + conversations to principals
-  LStore := TMemoryConversationStore.Create;
-  LConvConfig := THorseAIConversationsConfig.Default;
-  LConvConfig.Store := LStore;
-  LConvConfig.StreamManager := { your horse-ai THorseAIStreamManager };
-  THorse.Use(THorseAIConversations.New(LConvConfig));
+  // 2. One facade for the application
+  LConfig := THorseAIConversationsConfig.Default;      // in-memory store
+  LConfig.StreamManager := THorseAIStreamManager.Default;
+  LConversations := THorseAIConversations.Create(LConfig);
 
-  // 3. Route handlers use the facade to enforce ownership on every call
-  THorse.Post('/conversations/:id/messages',
+  // 3. Route handlers call the facade; it checks ownership on every call
+  THorse.Delete('/streams/:id',
     procedure(Req: THorseRequest; Res: THorseResponse)
     begin
-      // THorseAIConversations reads the principal from Req.Session[...]
-      // and emits 401/403 on the way to the store.
+      try
+        if LConversations.CancelForRequest(Req, Req.Params['id']) then
+          Res.Status(204)
+        else
+          Res.Status(404);
+      except
+        on E: EHorseSessionUnauthorized do Res.Status(401);
+        on E: EHorseAIStreamForbidden do Res.Status(403);
+      end;
     end);
 
   THorse.Listen(9000);
 end.
 ```
 
+The facade is not a middleware: create one instance and call it from your handlers. It reads the caller with `PrincipalOf(Req)` from `horse-session` and never trusts a tenant or user id sent by the client. Ids are compared exactly, so `Alice` and `alice` are two different owners.
+
+| Method | Refuses with |
+|--------|--------------|
+| `CreateFor`, `GetFor`, `AppendFor`, `DeleteFor` | `EHorseSessionUnauthorized` when not authenticated; another principal's conversation is reported as not found |
+| `StartStreamFor` | `EHorseSessionUnauthorized`; `EHorseAIConversationNotFound` when the conversation is not the caller's (no stream is created) |
+| `CancelForRequest` | `EHorseSessionUnauthorized`; `EHorseAIStreamForbidden` when the stream belongs to someone else (the stream keeps running); returns `False` when the stream is unknown or already finished |
+
+When a stream ends on its own, call `ForgetStream(streamId)` so its ownership entry is dropped.
+
 ## Ownership-check sequence
 
 ```
 DELETE /streams/{id}
       |
-  horse-session middleware  -> Req.Session[HORSE_SESSION_PRINCIPAL_KEY]
+  horse-session middleware  -> principal attached to the request
       |
-  TStreamOwnershipGuard middleware (preValidation)
+  your handler calls CancelForRequest(Req, stream_id)
       |
-  if not authenticated       -> 401
-  if owner != principal      -> 403
-  if stream_id not in map    -> 404  (terminal + removed OR never existed)
+  if not authenticated       -> EHorseSessionUnauthorized  (401)
+  if stream_id not in map    -> False                      (404)
+  if owner != principal      -> EHorseAIStreamForbidden    (403)
       |
   Call horse-ai Manager.Cancel(stream_id)
       |
@@ -85,7 +101,7 @@ DELETE /streams/{id}
   204 No Content
 ```
 
-Stream IDs are **never reused**. A `strm_<uuid>` whose state transitioned to terminal is removed from both horse-ai's manager and this package's ownership map. A second DELETE of the same id answers 404, not 403.
+Stream IDs are **never reused**. A cancelled stream is removed from this package's ownership map at once; a stream that ends on its own is removed when you call `ForgetStream`, or when a later cancel finds it gone. A second DELETE of the same id answers 404, not 403.
 
 ## Audit vocabulary this package reserves
 

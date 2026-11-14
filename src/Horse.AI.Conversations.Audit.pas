@@ -56,13 +56,9 @@ begin
   LEvent := MakeAuthEvent(AAction, ATenantId, APrincipalId,
                           'conversation', AConversationId,
                           AOutcome, AReason, ACorrelationId);
-  try
-    ASink.RecordEvent(LEvent);
-  except
-    // fail-open matches horse-session's default. If the caller configured
-    // its sink as fail-closed, the raise propagates and the request aborts.
-    raise;
-  end;
+  // An exception from the sink propagates to the caller: an audit sink
+  // that must never break a request has to swallow its own errors.
+  ASink.RecordEvent(LEvent);
 end;
 
 procedure EmitStreamEvent(const ASink: IAuthAuditSink;
@@ -76,11 +72,7 @@ begin
   LEvent := MakeAuthEvent(AAction, ATenantId, APrincipalId,
                           'stream', AStreamId,
                           AOutcome, AReason, ACorrelationId);
-  try
-    ASink.RecordEvent(LEvent);
-  except
-    raise;
-  end;
+  ASink.RecordEvent(LEvent);
 end;
 
 end.

@@ -6,25 +6,24 @@ unit Horse.AI.Conversations;
 //  horse-ai-conversations -- public facade
 //  -----------------------------------------------------------------------------
 //  Composes the store, the ownership map, and the audit sink into a single
-//  object. Every public method reads the authenticated principal from
-//  Req.Session[HORSE_SESSION_PRINCIPAL_KEY] (the constant imported from
-//  horse-session, NOT a local literal) and enforces ownership BEFORE
-//  touching the store or the stream manager.
+//  object. Every public method reads the authenticated principal with
+//  PrincipalOf(Req) from horse-session (Horse.Session.Types) and enforces
+//  ownership BEFORE touching the store or the stream manager. The request
+//  owns that principal; this unit never frees it.
 //
 //  Never trust client-supplied TenantId / PrincipalId / ConversationId
 //  beyond the latter as an identifier to look up. The authoritative
 //  (tenant, principal) comes from the authenticated principal.
 //
 //  Horse-ai integration:
-//    - StartStreamFor registers (principal, stream_id) in the ownership
-//      map immediately after horse-ai's CreateStream returns. Register
-//      sequence: CreateStream -> Register -> return stream id.
-//    - CancelForRequest looks up ownership FIRST, then calls
-//      horse-ai Manager.Cancel. Horse-ai's CancelAll stays shutdown-only.
-//    - Terminal transitions in horse-ai are mirrored by Unregister on
-//      this side via OnStreamTerminal (a callback hook on the manager).
-//      Scaffold leaves the hook wiring to the application; a drift-check
-//      test asserts the two maps stay in sync.
+//    - StartStreamFor first checks that the conversation belongs to the
+//      principal, then: CreateStream -> Register ownership -> return id.
+//    - CancelForRequest looks up ownership FIRST, then calls the manager's
+//      Cancel. Horse-ai's CancelAll stays shutdown-only.
+//    - When a stream ends on its own, horse-ai removes it from the manager
+//      but nothing tells this unit. Call ForgetStream(stream id) from the
+//      transport when that happens, or the ownership entry stays until a
+//      cancel attempt finds the stream gone and drops it.
 //
 //  FPC NOTE: methods take a THorseRequest and operate imperatively; the
 //  facade itself is NOT a middleware callback. Mount the horse-session
@@ -54,7 +53,9 @@ uses
 type
   THorseAIConversationsConfig = record
     Store: IAIConversationStore;
-    StreamManager: THorseAIStreamManager;   // from horse-ai
+    /// From horse-ai. Held as the interface: the manager is reference
+    /// counted, and a class-typed field would not keep it alive.
+    StreamManager: IHorseAIStreamManager;
     AuditSink: IAuthAuditSink;              // from horse-session
     class function Default: THorseAIConversationsConfig; static;
   end;
@@ -64,7 +65,6 @@ type
     FConfig: THorseAIConversationsConfig;
     FOwnership: TStreamOwnershipMap;
 
-    function ReadPrincipal(const AReq: THorseRequest): TPrincipal;
     function CorrelationId(const AReq: THorseRequest): string;
     procedure EnsureAuthenticated(const APrincipal: TPrincipal);
   public
@@ -95,9 +95,11 @@ type
                       const AConversationId: string): Boolean;
 
     /// Create a stream via horse-ai and register ownership against the
-    /// authenticated principal. Returns the stream id. SCAFFOLD: reads the
-    /// current messages into ARequest.Messages before calling
-    /// StreamManager.CreateStream.
+    /// authenticated principal. Returns the stream id. The conversation
+    /// must belong to the principal: otherwise this raises
+    /// EHorseAIConversationNotFound and no stream is created. ARequest is
+    /// passed to horse-ai as given; build its Messages yourself (GetFor
+    /// returns the stored ones).
     function StartStreamFor(const AReq: THorseRequest;
                             const AConversationId: string;
                             const AProviderName: string;
@@ -106,11 +108,17 @@ type
     /// Cancel a stream via horse-ai, after verifying the authenticated
     /// principal is the owner. Returns:
     ///   True   -- cancel issued
-    ///   False  -- stream not found (never existed OR terminal + removed)
+    ///   False  -- stream not found (never existed, already cancelled
+    ///             here, or finished and removed by horse-ai)
     /// Raises EHorseAIStreamForbidden when the principal is not the
-    /// stream's owner. (Handler translates to 403.)
+    /// stream's owner. (Handler translates to 403.) The stream of another
+    /// principal is never touched.
     function CancelForRequest(const AReq: THorseRequest;
                              const AStreamId: string): Boolean;
+
+    /// Drops the ownership entry of a stream that ended on its own.
+    /// Returns True when an entry existed.
+    function ForgetStream(const AStreamId: string): Boolean;
 
     property Ownership: TStreamOwnershipMap read FOwnership;
   end;
@@ -141,19 +149,6 @@ begin
   inherited Destroy;
 end;
 
-function THorseAIConversations.ReadPrincipal(const AReq: THorseRequest): TPrincipal;
-var
-  LObj: TObject;
-begin
-  Result := nil;
-  if AReq.Session.ContainsKey(HORSE_SESSION_PRINCIPAL_KEY) then
-  begin
-    LObj := TObject(AReq.Session[HORSE_SESSION_PRINCIPAL_KEY]);
-    if LObj is TPrincipal then
-      Result := TPrincipal(LObj);
-  end;
-end;
-
 function THorseAIConversations.CorrelationId(const AReq: THorseRequest): string;
 begin
   Result := AReq.Headers['X-Request-ID'];
@@ -170,7 +165,7 @@ function THorseAIConversations.CreateFor(const AReq: THorseRequest;
 var
   LPrincipal: TPrincipal;
 begin
-  LPrincipal := ReadPrincipal(AReq);
+  LPrincipal := PrincipalOf(AReq);
   EnsureAuthenticated(LPrincipal);
   Result := FConfig.Store.CreateConversation(LPrincipal.TenantId,
                                              LPrincipal.UserId, ATitle);
@@ -187,7 +182,7 @@ function THorseAIConversations.GetFor(const AReq: THorseRequest;
 var
   LPrincipal: TPrincipal;
 begin
-  LPrincipal := ReadPrincipal(AReq);
+  LPrincipal := PrincipalOf(AReq);
   EnsureAuthenticated(LPrincipal);
   Result := FConfig.Store.TryGet(LPrincipal.TenantId, LPrincipal.UserId,
                                  AConversationId, AConversation);
@@ -213,7 +208,7 @@ procedure THorseAIConversations.AppendFor(const AReq: THorseRequest;
 var
   LPrincipal: TPrincipal;
 begin
-  LPrincipal := ReadPrincipal(AReq);
+  LPrincipal := PrincipalOf(AReq);
   EnsureAuthenticated(LPrincipal);
   FConfig.Store.AppendMessage(LPrincipal.TenantId, LPrincipal.UserId,
                               AConversationId, AMessage);
@@ -227,7 +222,7 @@ function THorseAIConversations.DeleteFor(const AReq: THorseRequest;
 var
   LPrincipal: TPrincipal;
 begin
-  LPrincipal := ReadPrincipal(AReq);
+  LPrincipal := PrincipalOf(AReq);
   EnsureAuthenticated(LPrincipal);
   Result := FConfig.Store.Delete(LPrincipal.TenantId, LPrincipal.UserId,
                                  AConversationId);
@@ -244,11 +239,23 @@ function THorseAIConversations.StartStreamFor(const AReq: THorseRequest;
 var
   LPrincipal: TPrincipal;
   LOwner: TStreamOwnerKey;
+  LConversation: TAIConversation;
 begin
-  LPrincipal := ReadPrincipal(AReq);
+  LPrincipal := PrincipalOf(AReq);
   EnsureAuthenticated(LPrincipal);
   if FConfig.StreamManager = nil then
     raise Exception.Create('THorseAIConversations: StreamManager not configured');
+
+  // The conversation must be the caller's own before anything is started.
+  if not FConfig.Store.TryGet(LPrincipal.TenantId, LPrincipal.UserId,
+                              AConversationId, LConversation) then
+  begin
+    EmitConversationEvent(FConfig.AuditSink,
+      'conversation.access.denied',
+      LPrincipal.TenantId, LPrincipal.UserId, AConversationId,
+      'denied', 'not-found-or-ownership-mismatch', CorrelationId(AReq));
+    raise EHorseAIConversationNotFound.Create('conversation not found');
+  end;
 
   Result := FConfig.StreamManager.CreateStream(AProviderName, ARequest);
 
@@ -269,14 +276,17 @@ var
   LPrincipal: TPrincipal;
   LOwner: TStreamOwnerKey;
 begin
-  LPrincipal := ReadPrincipal(AReq);
+  LPrincipal := PrincipalOf(AReq);
   EnsureAuthenticated(LPrincipal);
+  if FConfig.StreamManager = nil then
+    raise Exception.Create('THorseAIConversations: StreamManager not configured');
 
   if not FOwnership.TryGetOwner(AStreamId, LOwner) then
-    Exit(False); // 404: never existed OR terminal + removed
+    Exit(False); // 404: never existed OR already cancelled / forgotten
 
-  if not (SameText(LOwner.TenantId, LPrincipal.TenantId) and
-          SameText(LOwner.PrincipalId, LPrincipal.UserId)) then
+  // Exact match: two ids that differ only by letter case are two owners.
+  if not ((LOwner.TenantId = LPrincipal.TenantId) and
+          (LOwner.PrincipalId = LPrincipal.UserId)) then
   begin
     EmitStreamEvent(FConfig.AuditSink,
       'stream.cancel.denied',
@@ -285,20 +295,24 @@ begin
     raise EHorseAIStreamForbidden.Create('stream ownership mismatch');
   end;
 
-  // SCAFFOLD: call horse-ai's manager Cancel. The exact method name on
-  // THorseAIStreamManager is Cancel(const AStreamId: string): Boolean per
-  // horse-ai/src/Horse.AI.StreamManager.pas. Compile verifies the signature;
-  // fill in once horse-ai is on the uses path.
-  Result := True;
+  // The caller owns the stream. Cancel flips the stream's cancel flag;
+  // horse-ai's transport notices it and ends the stream. False means the
+  // manager no longer has it (it finished and was removed).
+  Result := FConfig.StreamManager.Cancel(AStreamId);
 
-  EmitStreamEvent(FConfig.AuditSink,
-    'stream.cancelled',
-    LPrincipal.TenantId, LPrincipal.UserId, AStreamId,
-    'succeeded', '', CorrelationId(AReq));
-
-  // Unregister immediately -- the stream transitioned to terminal (or is
-  // about to). Keeps the drift check honest.
+  // Either way the entry is done with: cancelled now, or already gone.
   FOwnership.Unregister(AStreamId);
+
+  if Result then
+    EmitStreamEvent(FConfig.AuditSink,
+      'stream.cancelled',
+      LPrincipal.TenantId, LPrincipal.UserId, AStreamId,
+      'succeeded', '', CorrelationId(AReq));
+end;
+
+function THorseAIConversations.ForgetStream(const AStreamId: string): Boolean;
+begin
+  Result := FOwnership.Unregister(AStreamId);
 end;
 
 end.
